@@ -1,35 +1,18 @@
 /**
  * Quantumult X Resource Parser
- * Convert:
- *   1. anytls://password@host:port/?sni=xxx&insecure=1&alpn=h2,http/1.1#tag
- *   2. ss://base64(2022-blake3-aes-256-gcm:password)@host:port#tag
- * to Quantumult X anytls= format.
+ * 处理流程：
+ * 1. 支持整体 Base64 订阅；
+ * 2. 支持解码后的 ss://base64(method:password)@host:port#tag；
+ * 3. 将 SS2022 风格条目转成 QX anytls= 格式；
+ * 4. 同时保留 anytls:// 转换能力。
  */
 
-/**
- * 如果你的服务端必须指定固定 SNI，在这里填。
- * 例如你之前那条可用配置里是 m10.music.126.net，就填：
- * const DEFAULT_TLS_HOST = "m10.music.126.net";
- *
- * 如果不确定，先留空，parser 会默认用服务器域名作为 tls-host。
- */
-const DEFAULT_TLS_HOST = "m10.music.126.net";
+const DEFAULT_TLS_HOST = ""; 
+// 如果你的节点必须固定 SNI，例如 m10.music.126.net，就改成：
+// const DEFAULT_TLS_HOST = "m10.music.126.net";
 
-/**
- * 是否默认跳过 TLS 证书验证。
- * 你之前的 anytls URI 有 insecure=1，所以这里默认 false verification。
- */
 const DEFAULT_TLS_VERIFICATION_FALSE = true;
-
-/**
- * 是否默认加 h2,http/1.1 ALPN。
- * 你之前能连的关键字段就是这个，所以默认开启。
- */
 const DEFAULT_ALPN_HEX = "02683208687474702f312e31";
-
-/**
- * 是否把 ss:// 里 2022-blake3-aes-256-gcm 节点强制转成 anytls。
- */
 const CONVERT_SS2022_TO_ANYTLS = true;
 
 function safeDecode(s) {
@@ -41,65 +24,102 @@ function safeDecode(s) {
 }
 
 function b64Normalize(s) {
-  let b64 = (s || "").replace(/-/g, "+").replace(/_/g, "/");
+  let b64 = String(s || "")
+    .trim()
+    .replace(/\s+/g, "")
+    .replace(/-/g, "+")
+    .replace(/_/g, "/");
+
   while (b64.length % 4) b64 += "=";
   return b64;
 }
 
-function b64DecodeUtf8(s) {
+function b64DecodeBinary(s) {
   try {
-    const bin = atob(b64Normalize(s));
-    try {
-      return decodeURIComponent(
-        bin.split("").map(c => {
-          return "%" + c.charCodeAt(0).toString(16).padStart(2, "0");
-        }).join("")
-      );
-    } catch (e) {
-      return bin;
-    }
+    return atob(b64Normalize(s));
   } catch (e) {
     return "";
   }
 }
 
-function maybeBase64DecodeSubscription(content) {
-  const text = (content || "").trim();
+function binaryToUtf8(bin) {
+  try {
+    return decodeURIComponent(
+      bin.split("").map(function (c) {
+        return "%" + c.charCodeAt(0).toString(16).padStart(2, "0");
+      }).join("")
+    );
+  } catch (e) {
+    return bin;
+  }
+}
 
-  // 已经是明文订阅
+function b64DecodeUtf8(s) {
+  const bin = b64DecodeBinary(s);
+  if (!bin) return "";
+  return binaryToUtf8(bin);
+}
+
+function looksLikeBase64Subscription(text) {
+  const compact = String(text || "").trim().replace(/\s+/g, "");
+
+  if (!compact) return false;
+
+  // 明显已经是明文订阅
   if (
-    /^anytls:\/\//im.test(text) ||
-    /^ss:\/\//im.test(text) ||
-    /^anytls=/im.test(text) ||
-    /^shadowsocks=/im.test(text) ||
-    text.includes("\n")
+    /^ss:\/\//i.test(String(text).trim()) ||
+    /^anytls:\/\//i.test(String(text).trim()) ||
+    /^anytls=/i.test(String(text).trim()) ||
+    /^shadowsocks=/i.test(String(text).trim())
   ) {
-    return content;
+    return false;
   }
 
-  // 尝试整体 base64 订阅
-  const decoded = b64DecodeUtf8(text);
+  // Base64 字符集判断
+  return /^[A-Za-z0-9+/_=-]+$/.test(compact) && compact.length > 16;
+}
+
+function decodeSubscriptionIfNeeded(content) {
+  const raw = String(content || "");
+  const trimmed = raw.trim();
+
+  // 已经是明文协议列表
   if (
-    decoded &&
-    (
-      decoded.includes("ss://") ||
-      decoded.includes("anytls://") ||
-      decoded.includes("anytls=") ||
-      decoded.includes("shadowsocks=")
-    )
+    /^ss:\/\//im.test(trimmed) ||
+    /^anytls:\/\//im.test(trimmed) ||
+    /^anytls=/im.test(trimmed) ||
+    /^shadowsocks=/im.test(trimmed)
   ) {
-    return decoded;
+    return raw;
   }
 
-  return content;
+  // 关键修复：即使整体 Base64 有换行，也先去掉空白再解码
+  if (looksLikeBase64Subscription(raw)) {
+    const decoded = b64DecodeUtf8(raw);
+
+    if (
+      decoded &&
+      (
+        decoded.includes("ss://") ||
+        decoded.includes("anytls://") ||
+        decoded.includes("anytls=") ||
+        decoded.includes("shadowsocks=")
+      )
+    ) {
+      return decoded;
+    }
+  }
+
+  return raw;
 }
 
 function parseQuery(qs) {
   const obj = {};
   if (!qs) return obj;
 
-  qs.split("&").forEach(part => {
+  qs.split("&").forEach(function (part) {
     if (!part) return;
+
     const idx = part.indexOf("=");
     let k = "";
     let v = "";
@@ -122,12 +142,12 @@ function alpnToHex(alpn) {
 
   const protocols = alpn
     .split(",")
-    .map(x => x.trim())
+    .map(function (x) { return x.trim(); })
     .filter(Boolean);
 
   let hex = "";
 
-  protocols.forEach(p => {
+  protocols.forEach(function (p) {
     if (p.length <= 0 || p.length > 255) return;
 
     hex += p.length.toString(16).padStart(2, "0");
@@ -146,7 +166,6 @@ function splitHostPort(hostPort) {
 
   if (!hostPort) return { host, port };
 
-  // IPv6: [::1]:443
   if (hostPort.startsWith("[")) {
     const end = hostPort.indexOf("]");
     if (end >= 0) {
@@ -172,8 +191,8 @@ function buildQxAnytls(opts) {
   const password = opts.password || "";
   const tag = opts.tag || `${host}:${port}`;
 
-  let tlsHost = opts.tlsHost || DEFAULT_TLS_HOST || host;
-  let alpnHex = opts.alpnHex || DEFAULT_ALPN_HEX || "";
+  const tlsHost = opts.tlsHost || DEFAULT_TLS_HOST || host;
+  const alpnHex = opts.alpnHex || DEFAULT_ALPN_HEX || "";
 
   const out = [];
 
@@ -238,7 +257,7 @@ function convertAnytlsUri(line) {
 
     const password = safeDecode(authority.slice(0, atIndex));
     const hostPort = authority.slice(atIndex + 1);
-    const { host, port } = splitHostPort(hostPort);
+    const hp = splitHostPort(hostPort);
 
     const params = parseQuery(query);
 
@@ -247,13 +266,13 @@ function convertAnytlsUri(line) {
     const alpnHex = alpnToHex(params.alpn || "") || DEFAULT_ALPN_HEX;
 
     return buildQxAnytls({
-      host,
-      port,
-      password,
-      tag,
+      host: hp.host,
+      port: hp.port,
+      password: password,
+      tag: tag,
       tlsHost: sni,
       tlsVerificationFalse: insecure,
-      alpnHex,
+      alpnHex: alpnHex,
       realityPubkey: params.pbk || params.publicKey || "",
       realityShortid: params.sid || params.shortId || ""
     });
@@ -291,7 +310,7 @@ function convertSs2022UriToAnytls(line) {
 
     const userInfoB64 = main.slice(0, atIndex);
     const hostPort = main.slice(atIndex + 1);
-    const { host, port } = splitHostPort(hostPort);
+    const hp = splitHostPort(hostPort);
 
     const userInfo = b64DecodeUtf8(userInfoB64);
     if (!userInfo) return line;
@@ -302,7 +321,6 @@ function convertSs2022UriToAnytls(line) {
     const method = userInfo.slice(0, firstColon);
     const password = userInfo.slice(firstColon + 1);
 
-    // 只处理 Shadowsocks 2022 这类伪装/承载格式
     if (!/^2022-blake3-/i.test(method)) {
       return line;
     }
@@ -314,24 +332,24 @@ function convertSs2022UriToAnytls(line) {
     const alpnHex = alpnToHex(params.alpn || "") || DEFAULT_ALPN_HEX;
 
     return buildQxAnytls({
-      host,
-      port,
-      password,
-      tag,
+      host: hp.host,
+      port: hp.port,
+      password: password,
+      tag: tag,
       tlsHost: sni,
       tlsVerificationFalse: insecure,
-      alpnHex
+      alpnHex: alpnHex
     });
   } catch (e) {
     return line;
   }
 }
 
-let content = maybeBase64DecodeSubscription($resource.content || "");
+let content = decodeSubscriptionIfNeeded($resource.content || "");
 
 let converted = content
   .split(/\r?\n/)
-  .map(line => {
+  .map(function (line) {
     const trimmed = line.trim();
 
     if (!trimmed) return line;
