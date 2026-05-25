@@ -1,19 +1,22 @@
 /**
- * Quantumult X Resource Parser
- * 处理流程：
- * 1. 支持整体 Base64 订阅；
- * 2. 支持解码后的 ss://base64(method:password)@host:port#tag；
- * 3. 将 SS2022 风格条目转成 QX anytls= 格式；
- * 4. 同时保留 anytls:// 转换能力。
+ * Quantumult X Resource Parser - AnyTLS SS2022 diagnostic version
+ *
+ * It decodes:
+ *   Base64 subscription
+ *     -> ss://base64(2022-blake3-aes-256-gcm:xxx:yyy)@host:port#tag
+ *
+ * Then generates 3 QX anytls nodes:
+ *   [PASS] password=xxx:yyy
+ *   [FULL] password=2022-blake3-aes-256-gcm:xxx:yyy
+ *   [B64]  password=original userinfo base64
  */
 
-const DEFAULT_TLS_HOST = "m10.music.126.net"; 
-// 如果你的节点必须固定 SNI，例如 m10.music.126.net，就改成：
+const DEFAULT_TLS_HOST = "m10.music.126.net";
+// 如果你确定必须伪装 SNI，例如：
 // const DEFAULT_TLS_HOST = "m10.music.126.net";
 
 const DEFAULT_TLS_VERIFICATION_FALSE = true;
 const DEFAULT_ALPN_HEX = "02683208687474702f312e31";
-const CONVERT_SS2022_TO_ANYTLS = true;
 
 function safeDecode(s) {
   try {
@@ -34,56 +37,27 @@ function b64Normalize(s) {
   return b64;
 }
 
-function b64DecodeBinary(s) {
+function b64DecodeUtf8(s) {
   try {
-    return atob(b64Normalize(s));
+    const bin = atob(b64Normalize(s));
+    try {
+      return decodeURIComponent(
+        bin.split("").map(function (c) {
+          return "%" + c.charCodeAt(0).toString(16).padStart(2, "0");
+        }).join("")
+      );
+    } catch (e) {
+      return bin;
+    }
   } catch (e) {
     return "";
   }
-}
-
-function binaryToUtf8(bin) {
-  try {
-    return decodeURIComponent(
-      bin.split("").map(function (c) {
-        return "%" + c.charCodeAt(0).toString(16).padStart(2, "0");
-      }).join("")
-    );
-  } catch (e) {
-    return bin;
-  }
-}
-
-function b64DecodeUtf8(s) {
-  const bin = b64DecodeBinary(s);
-  if (!bin) return "";
-  return binaryToUtf8(bin);
-}
-
-function looksLikeBase64Subscription(text) {
-  const compact = String(text || "").trim().replace(/\s+/g, "");
-
-  if (!compact) return false;
-
-  // 明显已经是明文订阅
-  if (
-    /^ss:\/\//i.test(String(text).trim()) ||
-    /^anytls:\/\//i.test(String(text).trim()) ||
-    /^anytls=/i.test(String(text).trim()) ||
-    /^shadowsocks=/i.test(String(text).trim())
-  ) {
-    return false;
-  }
-
-  // Base64 字符集判断
-  return /^[A-Za-z0-9+/_=-]+$/.test(compact) && compact.length > 16;
 }
 
 function decodeSubscriptionIfNeeded(content) {
   const raw = String(content || "");
   const trimmed = raw.trim();
 
-  // 已经是明文协议列表
   if (
     /^ss:\/\//im.test(trimmed) ||
     /^anytls:\/\//im.test(trimmed) ||
@@ -93,9 +67,10 @@ function decodeSubscriptionIfNeeded(content) {
     return raw;
   }
 
-  // 关键修复：即使整体 Base64 有换行，也先去掉空白再解码
-  if (looksLikeBase64Subscription(raw)) {
-    const decoded = b64DecodeUtf8(raw);
+  const compact = trimmed.replace(/\s+/g, "");
+
+  if (/^[A-Za-z0-9+/_=-]+$/.test(compact) && compact.length > 16) {
+    const decoded = b64DecodeUtf8(compact);
 
     if (
       decoded &&
@@ -121,17 +96,11 @@ function parseQuery(qs) {
     if (!part) return;
 
     const idx = part.indexOf("=");
-    let k = "";
-    let v = "";
-
     if (idx === -1) {
-      k = safeDecode(part);
+      obj[safeDecode(part)] = "";
     } else {
-      k = safeDecode(part.slice(0, idx));
-      v = safeDecode(part.slice(idx + 1));
+      obj[safeDecode(part.slice(0, idx))] = safeDecode(part.slice(idx + 1));
     }
-
-    obj[k] = v;
   });
 
   return obj;
@@ -185,46 +154,124 @@ function splitHostPort(hostPort) {
   return { host, port };
 }
 
-function buildQxAnytls(opts) {
-  const host = opts.host || "";
-  const port = opts.port || "";
-  const password = opts.password || "";
-  const tag = opts.tag || `${host}:${port}`;
-
-  const tlsHost = opts.tlsHost || DEFAULT_TLS_HOST || host;
-  const alpnHex = opts.alpnHex || DEFAULT_ALPN_HEX || "";
-
+function buildQxAnytls(host, port, password, tag, tlsHost, alpnHex, insecure) {
   const out = [];
 
   out.push(`anytls=${host}:${port}`);
   out.push(`password=${password}`);
   out.push("over-tls=true");
 
-  if (tlsHost) {
-    out.push(`tls-host=${tlsHost}`);
+  const finalTlsHost = tlsHost || DEFAULT_TLS_HOST || host;
+  if (finalTlsHost) {
+    out.push(`tls-host=${finalTlsHost}`);
   }
 
-  if (opts.tlsVerificationFalse || DEFAULT_TLS_VERIFICATION_FALSE) {
+  if (insecure || DEFAULT_TLS_VERIFICATION_FALSE) {
     out.push("tls-verification=false");
   }
 
-  if (alpnHex) {
-    out.push(`tls-alpn=${alpnHex}`);
+  const finalAlpn = alpnHex || DEFAULT_ALPN_HEX;
+  if (finalAlpn) {
+    out.push(`tls-alpn=${finalAlpn}`);
     out.push("tls-no-session-ticket=true");
-  }
-
-  if (opts.realityPubkey) {
-    out.push(`reality-base64-pubkey=${opts.realityPubkey}`);
-  }
-
-  if (opts.realityShortid) {
-    out.push(`reality-hex-shortid=${opts.realityShortid}`);
   }
 
   out.push("udp-relay=true");
   out.push(`tag=${tag}`);
 
   return out.join(", ");
+}
+
+function convertSs2022ToThreeAnytls(line) {
+  const raw = line.trim();
+  if (!raw.startsWith("ss://")) return line;
+
+  try {
+    let body = raw.slice("ss://".length);
+    let tag = "";
+
+    const hashIndex = body.indexOf("#");
+    if (hashIndex >= 0) {
+      tag = safeDecode(body.slice(hashIndex + 1));
+      body = body.slice(0, hashIndex);
+    }
+
+    let main = body;
+    let query = "";
+
+    const qIndex = body.indexOf("?");
+    if (qIndex >= 0) {
+      main = body.slice(0, qIndex);
+      query = body.slice(qIndex + 1);
+    }
+
+    const atIndex = main.lastIndexOf("@");
+    if (atIndex < 0) return line;
+
+    const userInfoB64Raw = main.slice(0, atIndex);
+    const userInfoB64Normalized = b64Normalize(userInfoB64Raw);
+    const hostPort = main.slice(atIndex + 1);
+
+    const hp = splitHostPort(hostPort);
+    const userInfo = b64DecodeUtf8(userInfoB64Raw);
+
+    if (!userInfo) return line;
+
+    const firstColon = userInfo.indexOf(":");
+    if (firstColon < 0) return line;
+
+    const method = userInfo.slice(0, firstColon);
+    const passwordOnly = userInfo.slice(firstColon + 1);
+    const passwordFull = userInfo;
+    const passwordB64 = userInfoB64Normalized;
+
+    if (!/^2022-blake3-/i.test(method)) {
+      return line;
+    }
+
+    const params = parseQuery(query);
+    const sni = params.sni || params.host || params.tlsHost || "";
+    const insecure = params.insecure === "1" || params.insecure === "true";
+    const alpnHex = alpnToHex(params.alpn || "") || DEFAULT_ALPN_HEX;
+
+    const baseTag = tag || `${hp.host}:${hp.port}`;
+
+    const nodes = [];
+
+    nodes.push(buildQxAnytls(
+      hp.host,
+      hp.port,
+      passwordOnly,
+      `${baseTag} [PASS]`,
+      sni,
+      alpnHex,
+      insecure
+    ));
+
+    nodes.push(buildQxAnytls(
+      hp.host,
+      hp.port,
+      passwordFull,
+      `${baseTag} [FULL]`,
+      sni,
+      alpnHex,
+      insecure
+    ));
+
+    nodes.push(buildQxAnytls(
+      hp.host,
+      hp.port,
+      passwordB64,
+      `${baseTag} [B64]`,
+      sni,
+      alpnHex,
+      insecure
+    ));
+
+    return nodes.join("\n");
+  } catch (e) {
+    return line;
+  }
 }
 
 function convertAnytlsUri(line) {
@@ -260,86 +307,19 @@ function convertAnytlsUri(line) {
     const hp = splitHostPort(hostPort);
 
     const params = parseQuery(query);
-
     const sni = params.sni || params.host || params.tlsHost || "";
     const insecure = params.insecure === "1" || params.insecure === "true";
     const alpnHex = alpnToHex(params.alpn || "") || DEFAULT_ALPN_HEX;
 
-    return buildQxAnytls({
-      host: hp.host,
-      port: hp.port,
-      password: password,
-      tag: tag,
-      tlsHost: sni,
-      tlsVerificationFalse: insecure,
-      alpnHex: alpnHex,
-      realityPubkey: params.pbk || params.publicKey || "",
-      realityShortid: params.sid || params.shortId || ""
-    });
-  } catch (e) {
-    return line;
-  }
-}
-
-function convertSs2022UriToAnytls(line) {
-  const raw = line.trim();
-  if (!raw.startsWith("ss://")) return line;
-  if (!CONVERT_SS2022_TO_ANYTLS) return line;
-
-  try {
-    let body = raw.slice("ss://".length);
-    let tag = "";
-
-    const hashIndex = body.indexOf("#");
-    if (hashIndex >= 0) {
-      tag = safeDecode(body.slice(hashIndex + 1));
-      body = body.slice(0, hashIndex);
-    }
-
-    let main = body;
-    let query = "";
-
-    const qIndex = body.indexOf("?");
-    if (qIndex >= 0) {
-      main = body.slice(0, qIndex);
-      query = body.slice(qIndex + 1);
-    }
-
-    const atIndex = main.lastIndexOf("@");
-    if (atIndex < 0) return line;
-
-    const userInfoB64 = main.slice(0, atIndex);
-    const hostPort = main.slice(atIndex + 1);
-    const hp = splitHostPort(hostPort);
-
-    const userInfo = b64DecodeUtf8(userInfoB64);
-    if (!userInfo) return line;
-
-    const firstColon = userInfo.indexOf(":");
-    if (firstColon < 0) return line;
-
-    const method = userInfo.slice(0, firstColon);
-    const password = userInfo.slice(firstColon + 1);
-
-    if (!/^2022-blake3-/i.test(method)) {
-      return line;
-    }
-
-    const params = parseQuery(query);
-
-    const sni = params.sni || params.host || params.tlsHost || "";
-    const insecure = params.insecure === "1" || params.insecure === "true";
-    const alpnHex = alpnToHex(params.alpn || "") || DEFAULT_ALPN_HEX;
-
-    return buildQxAnytls({
-      host: hp.host,
-      port: hp.port,
-      password: password,
-      tag: tag,
-      tlsHost: sni,
-      tlsVerificationFalse: insecure,
-      alpnHex: alpnHex
-    });
+    return buildQxAnytls(
+      hp.host,
+      hp.port,
+      password,
+      tag || `${hp.host}:${hp.port}`,
+      sni,
+      alpnHex,
+      insecure
+    );
   } catch (e) {
     return line;
   }
@@ -352,18 +332,19 @@ let converted = content
   .map(function (line) {
     const trimmed = line.trim();
 
-    if (!trimmed) return line;
+    if (!trimmed) return "";
+
+    if (trimmed.startsWith("ss://")) {
+      return convertSs2022ToThreeAnytls(trimmed);
+    }
 
     if (trimmed.startsWith("anytls://")) {
       return convertAnytlsUri(trimmed);
     }
 
-    if (trimmed.startsWith("ss://")) {
-      return convertSs2022UriToAnytls(trimmed);
-    }
-
     return line;
   })
+  .filter(Boolean)
   .join("\n");
 
 $done({ content: converted });
