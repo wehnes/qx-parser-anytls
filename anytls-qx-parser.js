@@ -7,7 +7,7 @@
  * 4. 同时保留 anytls:// 转换能力。
  */
 
-const DEFAULT_TLS_HOST = ""; 
+const DEFAULT_TLS_HOST = "m10.music.126.net"; 
 // 如果你的节点必须固定 SNI，例如 m10.music.126.net，就改成：
 // const DEFAULT_TLS_HOST = "m10.music.126.net";
 
